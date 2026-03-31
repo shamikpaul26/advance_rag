@@ -7,10 +7,13 @@ import cohere
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_pinecone import PineconeVectorStore
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_community.retrievers.merger_retriever import MergerRetriever         # LOTR — merges N retrievers
 from langchain_community.document_transformers import LongContextReorder
 
 from config import PINECONE_API_KEY, PINECONE_INDEX_NAME, COHERE_API_KEY
@@ -228,54 +231,74 @@ class CohereReranker:
 
 
 # -----------------------------------------
-# Hybrid Retriever (BM25 + Dense + Rerank + LongContextReorder)
+# Dense-only LangChain BaseRetriever
+# (needed so MergerRetriever can wrap it)
 # -----------------------------------------
 
-class HybridRetriever:
+class DenseRetriever(BaseRetriever):
     """
-    Retrieval pipeline:
+    A standard LangChain BaseRetriever backed by Pinecone dense vectors only.
 
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  Query                                                           │
-    │    ├── OpenAI embed()  →  dense vector                          │
-    │    └── BM25 encode()   →  sparse vector                         │
-    │                                                                  │
-    │  Pinecone hybrid query (top_k = initial_top_k)                  │
-    │    → alpha × dense_score + (1-alpha) × sparse_score             │
-    │                                                                  │
-    │  CohereReranker  (cross-encoder, keep final_top_n)              │
-    │                                                                  │
-    │  LongContextReorder                                              │
-    │    → best docs placed at START and END of context               │
-    │    → combats "lost in the middle" LLM attention bias            │
-    └──────────────────────────────────────────────────────────────────┘
+    This is ONE of the two sources fed into MergerRetriever.
+    It uses cosine-style semantic search via PineconeVectorStore.
 
-    Parameters
-    ----------
-    namespace      : Pinecone namespace from ingest_pdf()
-    alpha          : 0=pure BM25, 1=pure vector, 0.5=balanced hybrid
-    initial_top_k  : candidates fetched from Pinecone before re-ranking
-    final_top_n    : documents kept after Cohere re-ranking
-    rerank_model   : Cohere re-rank model name
+    Why separate from HybridRetriever?
+    MergerRetriever requires LangChain BaseRetriever instances.
+    We expose dense-only and hybrid-only as separate retrievers so
+    MergerRetriever can independently pull candidates from each
+    strategy before merging and deduplicating.
     """
 
-    def __init__(
-        self,
-        namespace: str,
-        alpha: float = 0.5,
-        initial_top_k: int = 10,
-        final_top_n: int = 4,
-        rerank_model: str = "rerank-english-v3.0",
-    ):
-        self.namespace     = namespace
-        self.alpha         = alpha
-        self.initial_top_k = initial_top_k
+    namespace: str
+    top_k: int = 5
 
-        self.pc_index    = Pinecone(api_key=PINECONE_API_KEY).Index(PINECONE_INDEX_NAME)
-        self.embeddings  = OpenAIEmbeddings(model="text-embedding-3-small")
-        self.bm25_encoder = _load_bm25()
-        self.reranker    = CohereReranker(top_n=final_top_n, model=rerank_model)
-        self.reorder     = LongContextReorder()
+    # Pydantic fields — not init args
+    _vectorstore: PineconeVectorStore = None
+
+    def __init__(self, namespace: str, top_k: int = 5, **kwargs):
+        super().__init__(namespace=namespace, top_k=top_k, **kwargs)
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        self._vectorstore = PineconeVectorStore(
+            index_name=PINECONE_INDEX_NAME,
+            embedding=embeddings,
+            namespace=namespace,
+        )
+
+    def _get_relevant_documents(self, query: str) -> list[Document]:
+        docs = self._vectorstore.similarity_search(query, k=self.top_k)
+        for doc in docs:
+            doc.metadata["retriever_source"] = "dense"
+        print(f"[INFO] DenseRetriever returned {len(docs)} docs.")
+        return docs
+
+
+# -----------------------------------------
+# Hybrid-only LangChain BaseRetriever
+# (needed so MergerRetriever can wrap it)
+# -----------------------------------------
+
+class HybridBaseRetriever(BaseRetriever):
+    """
+    A LangChain BaseRetriever that performs BM25 + dense hybrid search
+    against Pinecone. This is the SECOND source fed into MergerRetriever.
+
+    Exposes the same interface as DenseRetriever so MergerRetriever
+    treats both uniformly.
+    """
+
+    namespace: str
+    alpha: float = 0.5
+    top_k: int = 5
+
+    _pc_index: object = None
+    _embeddings: OpenAIEmbeddings = None
+    _bm25_encoder: BM25Encoder = None
+
+    def __init__(self, namespace: str, alpha: float = 0.5, top_k: int = 5, **kwargs):
+        super().__init__(namespace=namespace, alpha=alpha, top_k=top_k, **kwargs)
+        self._pc_index  = Pinecone(api_key=PINECONE_API_KEY).Index(PINECONE_INDEX_NAME)
+        self._embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        self._bm25_encoder = _load_bm25()
 
     def _scale_scores(self, dense, sparse, alpha):
         return (
@@ -286,34 +309,134 @@ class HybridRetriever:
             }
         )
 
-    def get_relevant_documents(self, query: str) -> list[Document]:
-        # Step 1 — Hybrid retrieval from Pinecone
-        dense_q  = self.embeddings.embed_query(query)
-        sparse_q = self.bm25_encoder.encode_queries(query)
+    def _get_relevant_documents(self, query: str) -> list[Document]:
+        dense_q  = self._embeddings.embed_query(query)
+        sparse_q = self._bm25_encoder.encode_queries(query)
         scaled_dense, scaled_sparse = self._scale_scores(dense_q, sparse_q, self.alpha)
 
-        results = self.pc_index.query(
+        results = self._pc_index.query(
             vector=scaled_dense,
             sparse_vector=scaled_sparse,
-            top_k=self.initial_top_k,
+            top_k=self.top_k,
             namespace=self.namespace,
             include_metadata=True,
         )
 
-        candidates = []
+        docs = []
         for match in results.get("matches", []):
             metadata = match.get("metadata", {})
             text = metadata.pop("text", "")
-            metadata["hybrid_score"] = round(match.get("score", 0), 4)
-            candidates.append(Document(page_content=text, metadata=metadata))
+            metadata["hybrid_score"]      = round(match.get("score", 0), 4)
+            metadata["retriever_source"]  = "hybrid"
+            docs.append(Document(page_content=text, metadata=metadata))
 
-        print(f"[INFO] Hybrid search returned {len(candidates)} candidates.")
+        print(f"[INFO] HybridBaseRetriever returned {len(docs)} docs.")
+        return docs
 
-        # Step 2 — Cohere re-ranking
-        reranked = self.reranker.rerank(query=query, documents=candidates)
 
-        # Step 3 — LongContextReorder
-        # Reorders so highest-relevance docs appear at start & end of context.
+# -----------------------------------------
+# MergedHybridRetriever
+# Orchestrates: MergerRetriever → Dedup →
+#               CohereReranker → LongContextReorder
+# -----------------------------------------
+
+class MergedHybridRetriever:
+    """
+    Full retrieval pipeline combining two strategies via MergerRetriever,
+    then applying Cohere re-ranking and LongContextReorder.
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Query                                                              │
+    │    ├── DenseRetriever       (pure semantic, top_k=5)               │
+    │    └── HybridBaseRetriever  (BM25 + dense blend, top_k=5)          │
+    │                ↓                                                    │
+    │         MergerRetriever  (concatenates both result lists)           │
+    │                ↓                                                    │
+    │         Deduplication    (remove identical page_content)            │
+    │                ↓                                                    │
+    │         CohereReranker   (cross-encoder scores, keep top_n)         │
+    │                ↓                                                    │
+    │         LongContextReorder                                          │
+    │           → most relevant docs placed at START and END              │
+    │           → least relevant docs placed in the MIDDLE                │
+    │           → combats "lost in the middle" LLM attention bias         │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    Why LongContextReorder?
+    Research shows LLMs perform best on content at the beginning and end
+    of their context window, and tend to ignore content in the middle.
+    LongContextReorder interleaves docs so the highest-scored chunks
+    appear at positions the LLM pays most attention to.
+
+    Parameters
+    ----------
+    namespace      : Pinecone namespace from ingest_pdf()
+    alpha          : BM25/dense blend for HybridBaseRetriever
+    dense_top_k    : candidates from DenseRetriever
+    hybrid_top_k   : candidates from HybridBaseRetriever
+    final_top_n    : docs kept after Cohere re-ranking
+    rerank_model   : Cohere re-rank model name
+    """
+
+    def __init__(
+        self,
+        namespace: str,
+        alpha: float = 0.5,
+        dense_top_k: int = 5,
+        hybrid_top_k: int = 5,
+        final_top_n: int = 4,
+        rerank_model: str = "rerank-english-v3.0",
+    ):
+        # ── Two independent retrievers ────────────────────────────────
+        dense_retriever = DenseRetriever(
+            namespace=namespace,
+            top_k=dense_top_k,
+        )
+        hybrid_retriever = HybridBaseRetriever(
+            namespace=namespace,
+            alpha=alpha,
+            top_k=hybrid_top_k,
+        )
+
+        # ── MergerRetriever (LOTR) ────────────────────────────────────
+        # Calls both retrievers in parallel and concatenates their results.
+        # Automatically deduplicates by document ID when available.
+        self.merger = MergerRetriever(
+            retrievers=[dense_retriever, hybrid_retriever]
+        )
+
+        # ── Cohere Re-ranker ──────────────────────────────────────────
+        self.reranker = CohereReranker(top_n=final_top_n, model=rerank_model)
+
+        # ── LongContextReorder ────────────────────────────────────────
+        # Reorders so best docs are at start/end, worst in the middle.
+        self.reorder = LongContextReorder()
+
+    def _deduplicate(self, docs: list[Document]) -> list[Document]:
+        """Remove duplicate chunks by page_content."""
+        seen = set()
+        unique = []
+        for doc in docs:
+            key = doc.page_content.strip()
+            if key not in seen:
+                seen.add(key)
+                unique.append(doc)
+        print(f"[INFO] After dedup: {len(unique)} unique docs.")
+        return unique
+
+    def get_relevant_documents(self, query: str) -> list[Document]:
+        # Step 1 — Merge results from both retrievers
+        merged = self.merger.invoke(query)
+        print(f"[INFO] MergerRetriever returned {len(merged)} total docs.")
+
+        # Step 2 — Deduplicate
+        unique_docs = self._deduplicate(merged)
+
+        # Step 3 — Cohere re-ranking
+        reranked = self.reranker.rerank(query=query, documents=unique_docs)
+
+        # Step 4 — LongContextReorder
+        # Reorders so highest-relevance docs appear at start & end of list.
         reordered = self.reorder.transform_documents(reranked)
         print(f"[INFO] LongContextReorder applied. Final doc count: {len(reordered)}.")
 
@@ -330,32 +453,34 @@ class HybridRetriever:
 def get_rag_chain(
     namespace: str,
     alpha: float = 0.5,
-    initial_top_k: int = 10,
+    dense_top_k: int = 5,
+    hybrid_top_k: int = 5,
     final_top_n: int = 4,
     rerank_model: str = "rerank-english-v3.0",
 ):
     """
     Build the full RAG chain:
 
-      Pinecone Hybrid (BM25 + Dense)
-        → CohereReranker
-        → LongContextReorder
-        → GPT-4o-mini
-        → Answer
+      DenseRetriever ──┐
+                       ├─► MergerRetriever → Dedup → CohereRerank
+      HybridRetriever ─┘                           → LongContextReorder
+                                                   → GPT-4o-mini → Answer
 
     Parameters
     ----------
     namespace      : Pinecone namespace from ingest_pdf()
-    alpha          : 0=keyword-only, 1=vector-only, 0.5=balanced hybrid
-    initial_top_k  : candidates fetched from Pinecone before re-ranking
+    alpha          : BM25/dense blend (0=keyword, 1=vector, 0.5=balanced)
+    dense_top_k    : candidates from pure dense retriever
+    hybrid_top_k   : candidates from hybrid BM25+dense retriever
     final_top_n    : docs kept after Cohere re-ranking
     rerank_model   : Cohere re-rank model name
     """
 
-    retriever = HybridRetriever(
+    retriever = MergedHybridRetriever(
         namespace=namespace,
         alpha=alpha,
-        initial_top_k=initial_top_k,
+        dense_top_k=dense_top_k,
+        hybrid_top_k=hybrid_top_k,
         final_top_n=final_top_n,
         rerank_model=rerank_model,
     )

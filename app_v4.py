@@ -14,7 +14,7 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 st.set_page_config(page_title="Hybrid RAG Chatbot", layout="wide")
-st.title("📄🔍 Hybrid RAG  —  BM25 + Vector + Reranking + LongContextReorder")
+st.title("📄🔍 Hybrid RAG  —  BM25 + Vector + MergerRetriever + LongContextReorder")
 
 # ===============================
 # Session State
@@ -24,7 +24,8 @@ for key, default in [
     ("rag_chain",     None),
     ("messages",      []),
     ("alpha",         0.5),
-    ("initial_top_k", 10),
+    ("dense_top_k",   5),
+    ("hybrid_top_k",  5),
     ("final_top_n",   4),
     ("rerank_model",  "rerank-english-v3.0"),
 ]:
@@ -43,7 +44,7 @@ with st.sidebar:
         "Alpha  (0 = BM25-only · 1 = Vector-only)",
         min_value=0.0, max_value=1.0,
         value=st.session_state.alpha, step=0.05,
-        help="Controls the BM25 vs dense blend in hybrid search.",
+        help="Controls the BM25 vs dense blend inside HybridBaseRetriever.",
     )
     if alpha == 0.0:
         st.caption("🔤 Pure Keyword (BM25)")
@@ -58,7 +59,33 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Re-ranking controls ───────────────────────────────────────────
+    # ── MergerRetriever knobs ─────────────────────────────────────────
+    st.subheader("🔀 MergerRetriever")
+    st.caption(
+        "Two retrievers run independently and their results are merged + deduplicated "
+        "before re-ranking."
+    )
+
+    dense_top_k = st.slider(
+        "Dense retriever top_k",
+        min_value=2, max_value=15,
+        value=st.session_state.dense_top_k, step=1,
+        help="Candidates fetched by the pure semantic (dense) retriever.",
+    )
+
+    hybrid_top_k = st.slider(
+        "Hybrid retriever top_k",
+        min_value=2, max_value=15,
+        value=st.session_state.hybrid_top_k, step=1,
+        help="Candidates fetched by the BM25 + dense hybrid retriever.",
+    )
+
+    total_candidates = dense_top_k + hybrid_top_k
+    st.caption(f"Max merged candidates before dedup: **{total_candidates}**")
+
+    st.divider()
+
+    # ── Re-ranking ────────────────────────────────────────────────────
     st.subheader("🎯 Re-ranking (Cohere)")
 
     rerank_model = st.selectbox(
@@ -69,24 +96,12 @@ with st.sidebar:
             "rerank-english-v2.0",
         ],
         index=0,
-        help=(
-            "• english-v3.0       → fastest, English only\n"
-            "• multilingual-v3.0  → supports 100+ languages\n"
-            "• english-v2.0       → legacy fallback"
-        ),
-    )
-
-    initial_top_k = st.slider(
-        "Candidates fetched (initial_top_k)",
-        min_value=4, max_value=20,
-        value=st.session_state.initial_top_k, step=1,
-        help="How many chunks Pinecone returns BEFORE re-ranking.",
     )
 
     final_top_n = st.slider(
         "Chunks kept after re-ranking (final_top_n)",
-        min_value=1, max_value=min(initial_top_k, 8),
-        value=min(st.session_state.final_top_n, initial_top_k), step=1,
+        min_value=1, max_value=min(total_candidates, 10),
+        value=min(st.session_state.final_top_n, total_candidates), step=1,
         help="Top-N chunks passed to LongContextReorder and then to the LLM.",
     )
 
@@ -96,15 +111,17 @@ with st.sidebar:
     st.subheader("📐 LongContextReorder")
     st.info(
         "After re-ranking, docs are reordered so the **most relevant chunks "
-        "appear at the start and end** of the context window, reducing LLM "
-        "'lost-in-the-middle' attention bias. Always applied automatically."
+        "appear at the start and end** of the context window, and least relevant "
+        "in the middle — reducing LLM 'lost-in-the-middle' attention bias. "
+        "This is always applied automatically."
     )
 
     # Pipeline summary
     st.divider()
     st.markdown("**Pipeline summary**")
     st.markdown(
-        f"Hybrid search (BM25 + Dense) → `{initial_top_k}` candidates  \n"
+        f"DenseRetriever `{dense_top_k}` + HybridRetriever `{hybrid_top_k}`  \n"
+        f"→ MergerRetriever → Dedup  \n"
         f"→ Cohere re-rank → top `{final_top_n}`  \n"
         f"→ LongContextReorder → GPT-4o-mini"
     )
@@ -114,21 +131,24 @@ with st.sidebar:
     # Rebuild chain when settings change
     settings_changed = (
         alpha         != st.session_state.alpha         or
-        initial_top_k != st.session_state.initial_top_k or
+        dense_top_k   != st.session_state.dense_top_k   or
+        hybrid_top_k  != st.session_state.hybrid_top_k  or
         final_top_n   != st.session_state.final_top_n   or
         rerank_model  != st.session_state.rerank_model
     )
 
     if settings_changed and st.session_state.namespace:
-        st.session_state.alpha         = alpha
-        st.session_state.initial_top_k = initial_top_k
-        st.session_state.final_top_n   = final_top_n
-        st.session_state.rerank_model  = rerank_model
+        st.session_state.alpha        = alpha
+        st.session_state.dense_top_k  = dense_top_k
+        st.session_state.hybrid_top_k = hybrid_top_k
+        st.session_state.final_top_n  = final_top_n
+        st.session_state.rerank_model = rerank_model
         try:
             st.session_state.rag_chain = get_rag_chain(
                 st.session_state.namespace,
                 alpha=alpha,
-                initial_top_k=initial_top_k,
+                dense_top_k=dense_top_k,
+                hybrid_top_k=hybrid_top_k,
                 final_top_n=final_top_n,
                 rerank_model=rerank_model,
             )
@@ -153,7 +173,8 @@ if not st.session_state.rag_chain:
                 st.session_state.rag_chain = get_rag_chain(
                     existing_namespace,
                     alpha=st.session_state.alpha,
-                    initial_top_k=st.session_state.initial_top_k,
+                    dense_top_k=st.session_state.dense_top_k,
+                    hybrid_top_k=st.session_state.hybrid_top_k,
                     final_top_n=st.session_state.final_top_n,
                     rerank_model=st.session_state.rerank_model,
                 )
@@ -194,7 +215,8 @@ if uploaded_file:
                 st.session_state.rag_chain = get_rag_chain(
                     expected_namespace,
                     alpha=st.session_state.alpha,
-                    initial_top_k=st.session_state.initial_top_k,
+                    dense_top_k=st.session_state.dense_top_k,
+                    hybrid_top_k=st.session_state.hybrid_top_k,
                     final_top_n=st.session_state.final_top_n,
                     rerank_model=st.session_state.rerank_model,
                 )
@@ -212,11 +234,12 @@ if uploaded_file:
                     st.session_state.rag_chain = get_rag_chain(
                         namespace,
                         alpha=st.session_state.alpha,
-                        initial_top_k=st.session_state.initial_top_k,
+                        dense_top_k=st.session_state.dense_top_k,
+                        hybrid_top_k=st.session_state.hybrid_top_k,
                         final_top_n=st.session_state.final_top_n,
                         rerank_model=st.session_state.rerank_model,
                     )
-                    st.success("✅ PDF indexed with Hybrid Search + Reranking + LongContextReorder.")
+                    st.success("✅ PDF indexed with MergerRetriever + LongContextReorder.")
                 except Exception as e:
                     st.error(f"❌ Ingestion failed: {e}")
 
@@ -242,7 +265,7 @@ if st.session_state.rag_chain:
             st.markdown(user_input)
 
         with st.chat_message("assistant"):
-            with st.spinner("Retrieving → Re-ranking → Reordering → Generating..."):
+            with st.spinner("Merging → Re-ranking → Reordering → Generating..."):
                 try:
                     answer = st.session_state.rag_chain.invoke(user_input)
                 except Exception as e:
