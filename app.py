@@ -14,7 +14,7 @@ UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 st.set_page_config(page_title="Hybrid RAG Chatbot", layout="wide")
-st.title("📄🔍 RAG Chatbot  —  Hybrid · Fusion · Rerank · LongContextReorder")
+st.title("RAG Chatbot  —  Hybrid · Fusion · Rerank · LongContextReorder")
 
 # ===============================
 # Session State
@@ -133,7 +133,7 @@ with st.sidebar:
     st.divider()
 
     # ── Re-ranking ────────────────────────────────────────────────────
-    st.subheader("🎯 Re-ranking (Cohere)")
+    st.subheader("Re-ranking (Cohere)")
 
     rerank_model = st.selectbox(
         "Re-rank Model",
